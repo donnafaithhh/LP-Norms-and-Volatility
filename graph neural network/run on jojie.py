@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Linear
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 # training
 from sklearn.model_selection import TimeSeriesSplit
@@ -27,9 +27,10 @@ class AdjacencyMatrixDataset(Dataset):
     Dataset for loading adjacency matrices from pickle files.
     """
     
-    def __init__(self, directory, transform=None):
+    def __init__(self, directory, time_steps=10, transform=None):
         self.directory = directory
         self.transform = transform
+        self.time_steps = time_steps
         
         self.files = sorted(
             f for f in os.listdir(directory) 
@@ -50,21 +51,30 @@ class AdjacencyMatrixDataset(Dataset):
         self.matrices = np.array(self.matrices)
         
     def __len__(self):
-        return len(self.files)
+        # Return number of sequences we can create
+        return max(0, len(self.files) - self.time_steps)
     
     def __getitem__(self, idx):
-        matrix = self.matrices[idx]
-        matrix_tensor = torch.tensor(matrix, dtype=torch.float32)
+        # Get sequence of time_steps matrices
+        sequence = self.matrices[idx:idx + self.time_steps]
+        # Target is the next matrix after the sequence
+        target = self.matrices[idx + self.time_steps]
         
-        if len(matrix_tensor.shape) == 2:
-            matrix_tensor = matrix_tensor.unsqueeze(0)
+        # Convert to tensors
+        sequence_tensor = torch.tensor(sequence, dtype=torch.float32)  # (time_steps, N, N)
+        target_tensor = torch.tensor(target, dtype=torch.float32)  # (N, N)
         
-        date = self.dates[idx]
+        # Add channel dimension if needed
+        if len(sequence_tensor.shape) == 3:
+            sequence_tensor = sequence_tensor.unsqueeze(2)  # (time_steps, N, 1, N)
+        
+        dates_sequence = self.dates[idx:idx + self.time_steps]
+        target_date = self.dates[idx + self.time_steps]
         
         if self.transform:
-            matrix_tensor = self.transform(matrix_tensor)
+            sequence_tensor = self.transform(sequence_tensor)
             
-        return matrix_tensor, date
+        return sequence_tensor, target_tensor, dates_sequence, target_date
     
     def get_all_matrices(self):
         return torch.tensor(self.matrices, dtype=torch.float32)
@@ -75,22 +85,6 @@ class AdjacencyMatrixDataset(Dataset):
     def get_shape(self):
         return self.matrices.shape
 
-# access dataset
-dataset = AdjacencyMatrixDataset("adjacency matrices 2")
-
-# train test split
-test_percent = 0.2
-test_pts = int(np.floor(len(dataset) * test_percent))
-train_pts = len(dataset) - test_pts
-
-# get train test dataset
-train_dataset = torch.utils.data.Subset(dataset, range(train_pts))
-test_dataset = torch.utils.data.Subset(dataset, range(train_pts, len(dataset)))
-
-# put inside dataloader
-train_dataloader = DataLoader(train_dataset, batch_size=32, shuffle=False)
-test_dataloader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
 class GCNLayer(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(GCNLayer, self).__init__()
@@ -98,7 +92,7 @@ class GCNLayer(nn.Module):
         
     def forward(self, x, adj):
         if adj.dim() == 2:
-            adj = adj.unsqueeze(0)
+            adj = adj.unsqueeze(0).expand(x.size(0), -1, -1)
         
         if x.dim() == 2:
             x = x.unsqueeze(0)
@@ -128,7 +122,7 @@ class TGCNCell(nn.Module):
         combined_reset = torch.cat([x, r * h], dim=-1)
         h_tilde = torch.tanh(self.gcn_candidate(combined_reset, adj))
         h_new = (1 - z) * h + z * h_tilde
-        return h_new.squeeze(0)
+        return h_new
 
 class TGCNLayer(nn.Module):
     def __init__(self, in_channels, hidden_channels, dropout=0.3):
@@ -151,23 +145,25 @@ class TGCNLayer(nn.Module):
         return torch.stack(outputs, dim=1)
 
 class TGCNModel(nn.Module):
-    def __init__(self, num_nodes=498, in_channels=1, hidden_channels=128, 
+    def __init__(self, num_nodes=496, hidden_channels=128, 
                  num_layers=8, dropout=0.3, time_steps=10):
         super(TGCNModel, self).__init__()
         self.num_nodes = num_nodes
         self.time_steps = time_steps
-        self.input_proj = nn.Linear(in_channels, hidden_channels)
+        self.hidden_channels = hidden_channels
+        self.input_proj = nn.Linear(num_nodes, hidden_channels)
         self.tgcn_layers = nn.ModuleList()
         for i in range(num_layers):
             layer_input_channels = hidden_channels if i > 0 else hidden_channels
             self.tgcn_layers.append(
                 TGCNLayer(layer_input_channels, hidden_channels, dropout)
             )
+        
         self.decoder = nn.Sequential(
-            nn.Linear(hidden_channels * 2, hidden_channels),
+            nn.Linear(hidden_channels, hidden_channels),
             nn.LeakyReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_channels, 1)
+            nn.Linear(hidden_channels, num_nodes)
         )
         self.reset_parameters()
         
@@ -179,7 +175,8 @@ class TGCNModel(nn.Module):
                     nn.init.zeros_(module.bias)
     
     def forward(self, x_seq, adj):
-        batch_size = x_seq.size(0)
+        batch_size, time_steps, num_nodes, _, _ = x_seq.shape
+        x_seq = x_seq.squeeze(3)
         x_seq = self.input_proj(x_seq)
         h = x_seq
         for i, layer in enumerate(self.tgcn_layers):
@@ -191,89 +188,175 @@ class TGCNModel(nn.Module):
                     h = h_new
             else:
                 h = h_new
+        
         final_hidden = h[:, -1, :, :]
-        return final_hidden
+        
+        output = self.decoder(final_hidden)
+        output = torch.bmm(output, output.transpose(1, 2))
+        
+        return output
+
+def evaluate_model(model, dataloader, criterion, device):
+    model.eval()
+    running_loss = 0.0
+    all_preds = []
+    all_targets = []
+    all_probs = []
     
-    def predict_links(self, node_embeddings, edge_pairs):
-        batch_size = node_embeddings.size(0)
-        src_nodes = edge_pairs[:, 0]
-        dst_nodes = edge_pairs[:, 1]
-        src_emb = node_embeddings[:, src_nodes, :]
-        dst_emb = node_embeddings[:, dst_nodes, :]
-        edge_features = torch.cat([src_emb, dst_emb], dim=-1)
-        logits = self.decoder(edge_features).squeeze(-1)
-        return logits
+    with torch.no_grad():
+        for sequences, targets, _, _ in dataloader:
+            sequences = sequences.to(device)
+            targets = targets.to(device)
+            
+            adj = sequences[0, 0, :, 0, :]
+            
+            outputs = model(sequences, adj)
+            loss = criterion(outputs, targets)
+            running_loss += loss.item() * sequences.size(0)
+            
+            probs = torch.sigmoid(outputs)
+            
+            all_preds.append(outputs.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+            all_targets.append(targets.cpu().numpy())
+    
+    epoch_loss = running_loss / len(dataloader.dataset)
+    
+    all_probs = np.concatenate(all_probs, axis=0).flatten()
+    all_targets = np.concatenate(all_targets, axis=0).flatten()
+    
+    pred_binary = (all_probs > 0.5).astype(int)
+    
+    try:
+        auc_roc = roc_auc_score(all_targets, all_probs)
+    except ValueError:
+        auc_roc = 0.5
+    
+    try:
+        auc_pr = average_precision_score(all_targets, all_probs)
+    except ValueError:
+        auc_pr = 0.0
+    
+    try:
+        f1 = f1_score(all_targets, pred_binary)
+    except ValueError:
+        f1 = 0.0
+    
+    return {
+        'loss': epoch_loss,
+        'auc_roc': auc_roc,
+        'auc_pr': auc_pr,
+        'f1_score': f1
+    }
+
+# access dataset
+time_steps = 10
+dataset = AdjacencyMatrixDataset("adjacency matrices 2", time_steps=time_steps)
 
 # setting parameters
-verbose = True
-epochs = 3000
-patience = 50
-dropout = 0.3
-best_loss = np.inf
-best_accuracy = -np.inf
-best_model_wts = copy.deepcopy(model.state_dict())
-counter = 0
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+n_splits = 5
+tscv = TimeSeriesSplit(n_splits=n_splits)
 
+# results
+cv_results = []
+best_model_state = None
+best_cv_score = -np.inf
 
-# instantiate model
-model = CNN(dropout=0.3).to(device)
-criterion = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-# temp var per model with x dropout
-best_model_temp = copy.deepcopy(model.state_dict())
-best_loss_temp = np.inf
-best_accuracy_temp = -np.inf
-
-# train every epoch
-for epoch in range(epochs):
-    model.train()
-    running_loss = 0.0
-    for images, labels in train_loader:
-        images = images.to(device)
-        labels = labels.to(device)
-        
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        
-        running_loss += loss.item() * images.size(0)
-
-    # get performance
-    epoch_loss = running_loss / len(train_loader.dataset)    
-    epoch_accuracy = evaluate_model(model, test_loader)
+# train model
+for fold, (train_index, val_index) in enumerate(tscv.split(range(len(dataset)))):
+    print(f"\nFold {fold + 1}/{n_splits}\n")  
     
-    # early stopping
-    if epoch_loss < best_loss_temp:
-        best_loss_temp = epoch_loss
-        best_accuracy_temp = epoch_accuracy
-        best_model_temp = copy.deepcopy(model.state_dict())
-        counter = 0
-    else:
-        counter += 1
-
-    if counter >= patience:
-        if verbose:
-            print()
-            print(f"Early stopping at epoch {epoch + 1}, dropout {dropout}")
-            print(f"Loss of best model: {best_loss_temp}")
-            print(f"Accuracy of best model: {best_accuracy_temp}")
-            print()
-        break
-
-    if verbose:
-        if epoch % 50 == 0:
-            print(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.4f}, Dropout: {dropout}")
-
-    if best_accuracy_temp > best_accuracy:
-    # if best_loss_temp < best_loss:
-        best_loss = best_loss_temp
-        best_accuracy = best_accuracy_temp
-        best_model_wts = best_model_temp
+    # train and validation subsets
+    train_subset = Subset(dataset, train_index)
+    val_subset = Subset(dataset, val_index)    
+    train_loader = DataLoader(train_subset, batch_size=16, shuffle=False)
+    val_loader = DataLoader(val_subset, batch_size=16, shuffle=False)
+    
+    # initialize model
+    model = TGCNModel(num_nodes=496, hidden_channels=128, num_layers=8, 
+                      dropout=0.3, time_steps=time_steps).to(device)
+    
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    # parameters
+    epochs = 1000
+    patience = 50
+    best_loss = np.inf
+    best_accuracy = -np.inf
+    best_model_wts = copy.deepcopy(model.state_dict())
+    counter = 0
+    
+    # loop
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
         
+        for sequences, targets, _, _ in train_loader:
+            sequences = sequences.to(device)
+            targets = targets.to(device)
+            adj = sequences[0, 0, :, 0, :]
+            
+            optimizer.zero_grad()
+            outputs = model(sequences, adj)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * sequences.size(0)
+        
+        epoch_loss = running_loss / len(train_loader.dataset)
+        
+        # validation
+        val_metrics = evaluate_model(model, val_loader, criterion, device)
+        val_loss = val_metrics['loss']
+        val_accuracy = val_metrics['f1_score']
+        
+        # early stopping
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_accuracy = val_accuracy
+            best_model_wts = copy.deepcopy(model.state_dict())
+            counter = 0
+        else:
+            counter += 1
+        
+        if counter >= patience:
+            if epoch % 50 == 0 or epoch == epochs - 1:
+                print(f"Fold {fold + 1}, Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+        
+        if epoch % 50 == 0:
+            print(f"Fold {fold + 1}, Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+    
+    # store fold results
+    cv_results.append({
+        'fold': fold + 1,
+        'best_loss': best_loss,
+        'best_accuracy': best_accuracy
+    })
+    
+    if best_accuracy > best_cv_score:
+        best_cv_score = best_accuracy
+        best_model_state = best_model_wts
+    
+    print(f"Fold {fold + 1} - Best Val Loss: {best_loss:.4f}, Best Val Acc: {best_accuracy:.4f}")
+
+# CV results
+print("\n" + "="*50)
+print("CROSS-VALIDATION RESULTS")
+print("="*50)
+for result in cv_results:
+    print(f"Fold {result['fold']}: Loss = {result['best_loss']:.4f}, Accuracy = {result['best_accuracy']:.4f}")
+
+mean_accuracy = np.mean([r['best_accuracy'] for r in cv_results])
+std_accuracy = np.std([r['best_accuracy'] for r in cv_results])
+print(f"\nMean CV Accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}")
 
 # save best model
-model.load_state_dict(best_model_wts)
-torch.save(model.state_dict(), "best tgcn weights.pth")
+if best_model_state is not None:
+    torch.save(best_model_state, "best_tgcn_weights.pth")
+    print("\nBest model saved as 'best_tgcn_weights.pth'")
