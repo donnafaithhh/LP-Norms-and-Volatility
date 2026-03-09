@@ -252,6 +252,10 @@ def evaluate_model(model, dataloader, criterion, device):
 # access dataset
 time_steps = 10
 dataset = AdjacencyMatrixDataset("adjacency matrices 2", time_steps=time_steps)
+all_matrices = dataset.get_all_matrices().numpy()
+nan_count = np.isnan(all_matrices).sum()
+if nan_count > 0:
+    dataset.matrices = np.nan_to_num(dataset.matrices, nan=0.0)
 
 # setting parameters
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -283,7 +287,7 @@ for fold, (train_index, val_index) in enumerate(tscv.split(range(len(dataset))))
     
     # parameters
     epochs = 1000
-    patience = 50
+    patience = np.floor(epochs * 0.05)
     best_loss = np.inf
     best_accuracy = -np.inf
     best_model_wts = copy.deepcopy(model.state_dict())
@@ -302,6 +306,10 @@ for fold, (train_index, val_index) in enumerate(tscv.split(range(len(dataset))))
             optimizer.zero_grad()
             outputs = model(sequences, adj)
             loss = criterion(outputs, targets)
+
+            # gradient clipping even if they didnt mention this
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             loss.backward()
             optimizer.step()
             
