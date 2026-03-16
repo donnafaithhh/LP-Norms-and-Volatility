@@ -260,23 +260,38 @@ if nan_count > 0:
 # setting parameters
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-n_splits = 5
-tscv = TimeSeriesSplit(n_splits=n_splits)
+
+# Monte Carlo Cross Validation parameters
+n_iterations = 20  # number of random train/val splits
+train_ratio = 0.8  # 80% training, 20% validation
+random_seed = 42  # for reproducibility
+np.random.seed(random_seed)
 
 # results
 cv_results = []
 best_model_state = None
 best_cv_score = -np.inf
 
-# train model
-for fold, (train_index, val_index) in enumerate(tscv.split(range(len(dataset)))):
-    print(f"\nFold {fold + 1}/{n_splits}\n")  
+# Monte Carlo Cross Validation loop
+for iteration in range(n_iterations):
+    print(f"\n{'='*50}")
+    print(f"Monte Carlo Iteration {iteration + 1}/{n_iterations}")
+    print(f"{'='*50}")
+    
+    # Generate random indices for train/val split
+    n_samples = len(dataset)
+    indices = np.random.permutation(n_samples)
+    split_point = int(n_samples * train_ratio)
+    train_index = indices[:split_point]
+    val_index = indices[split_point:]
     
     # train and validation subsets
     train_subset = Subset(dataset, train_index)
     val_subset = Subset(dataset, val_index)    
-    train_loader = DataLoader(train_subset, batch_size=16, shuffle=False)
+    train_loader = DataLoader(train_subset, batch_size=16, shuffle=True)  # shuffle=True for training
     val_loader = DataLoader(val_subset, batch_size=16, shuffle=False)
+    
+    print(f"Train samples: {len(train_index)}, Validation samples: {len(val_index)}")
     
     # initialize model
     model = TGCNModel(num_nodes=496, hidden_channels=128, num_layers=8, 
@@ -287,13 +302,13 @@ for fold, (train_index, val_index) in enumerate(tscv.split(range(len(dataset))))
     
     # parameters
     epochs = 1000
-    patience = np.floor(epochs * 0.05)
+    patience = int(epochs * 0.05)  # 5% of epochs
     best_loss = np.inf
     best_accuracy = -np.inf
     best_model_wts = copy.deepcopy(model.state_dict())
     counter = 0
     
-    # loop
+    # training loop
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
@@ -307,7 +322,7 @@ for fold, (train_index, val_index) in enumerate(tscv.split(range(len(dataset))))
             outputs = model(sequences, adj)
             loss = criterion(outputs, targets)
 
-            # gradient clipping even if they didnt mention this
+            # gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             loss.backward()
@@ -333,38 +348,47 @@ for fold, (train_index, val_index) in enumerate(tscv.split(range(len(dataset))))
         
         if counter >= patience:
             if epoch % 50 == 0 or epoch == epochs - 1:
-                print(f"Fold {fold + 1}, Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+                print(f"Iteration {iteration + 1}, Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
             print(f"Early stopping at epoch {epoch + 1}")
             break
         
         if epoch % 50 == 0:
-            print(f"Fold {fold + 1}, Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
+            print(f"Iteration {iteration + 1}, Epoch {epoch + 1}: Train Loss: {epoch_loss:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_accuracy:.4f}")
     
-    # store fold results
+    # store iteration results
     cv_results.append({
-        'fold': fold + 1,
+        'iteration': iteration + 1,
         'best_loss': best_loss,
-        'best_accuracy': best_accuracy
+        'best_accuracy': best_accuracy,
+        'train_indices': train_index,
+        'val_indices': val_index
     })
     
     if best_accuracy > best_cv_score:
         best_cv_score = best_accuracy
         best_model_state = best_model_wts
     
-    print(f"Fold {fold + 1} - Best Val Loss: {best_loss:.4f}, Best Val Acc: {best_accuracy:.4f}")
+    print(f"\nIteration {iteration + 1} - Best Val Loss: {best_loss:.4f}, Best Val Acc: {best_accuracy:.4f}")
 
-# CV results
+# Monte Carlo CV results
 print("\n" + "="*50)
-print("CROSS-VALIDATION RESULTS")
+print("MONTE CARLO CROSS-VALIDATION RESULTS")
 print("="*50)
 for result in cv_results:
-    print(f"Fold {result['fold']}: Loss = {result['best_loss']:.4f}, Accuracy = {result['best_accuracy']:.4f}")
+    print(f"Iteration {result['iteration']}: Loss = {result['best_loss']:.4f}, Accuracy = {result['best_accuracy']:.4f}")
 
 mean_accuracy = np.mean([r['best_accuracy'] for r in cv_results])
 std_accuracy = np.std([r['best_accuracy'] for r in cv_results])
-print(f"\nMean CV Accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}")
+print(f"\nMean Accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}")
+
+# Additional statistics for Monte Carlo CV
+print(f"\nADDITIONAL STATISTICS:")
+print(f"Min Accuracy: {np.min([r['best_accuracy'] for r in cv_results]):.4f}")
+print(f"Max Accuracy: {np.max([r['best_accuracy'] for r in cv_results]):.4f}")
+print(f"95% Confidence Interval: [{mean_accuracy - 1.96*std_accuracy/np.sqrt(n_iterations):.4f}, "
+      f"{mean_accuracy + 1.96*std_accuracy/np.sqrt(n_iterations):.4f}]")
 
 # save best model
 if best_model_state is not None:
-    torch.save(best_model_state, "best_tgcn_weights.pth")
-    print("\nBest model saved as 'best_tgcn_weights.pth'")
+    torch.save(best_model_state, "best_tgcn_weights_monte_carlo.pth")
+    print("\nBest model saved as 'best_tgcn_weights_monte_carlo.pth'")
